@@ -3,6 +3,5 @@
 
 void bleInit(const char* deviceName);
 bool bleIsConnected();
-bool bleHasCommand();
-String bleReadCommand();
-void bleSendTelemetry(const String& message);
+bool bleReceiveCommand(String& outCommand);
+bool bleSendTelemetry(const String& message);

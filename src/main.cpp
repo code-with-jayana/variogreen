@@ -11,12 +11,14 @@ enum SystemState {
 };
 
 SystemState currentState = STATE_IDLE;
+String activeFaultReason = "NONE";
 bool targetZones[5] = {false, false, false, false, false};
 float targetPsi = 0.0f;
 unsigned long stateStartTime = 0;
 unsigned long lastTelemetryTime = 0;
+uint32_t telemetrySeq = 0;
+bool wasConnected = false;
 
-// Helper: Force every actuator LOW (fail-safe)
 void disableAllActuators() {
   digitalWrite(PIN_COMPRESSOR_A0, LOW);
   for (uint8_t i = 0; i < 5; i++) {
@@ -25,10 +27,35 @@ void disableAllActuators() {
   digitalWrite(PIN_EXHAUST_A6, LOW);
 }
 
-// Helper: Read potentiometer and map 0-4095 -> 0.0-MAX_SIMULATED_PSI
-float readSimulatedPsi() {
-  int rawAdc = analogRead(PIN_PRESSURE_ADC);
-  return (rawAdc / 4095.0f) * MAX_SIMULATED_PSI;
+void triggerFault(const String& reason) {
+  disableAllActuators();
+  currentState = STATE_FAULT;
+  activeFaultReason = reason;
+  digitalWrite(PIN_FAULT_LED, HIGH);
+  telemetrySeq++;
+  bleSendTelemetry("#" + String(telemetrySeq) + "|FAULT:" + reason + "|LOCKOUT:ACTIVE");
+}
+
+float readFilteredPsi() {
+  static float emaAdc = -1.0f;
+
+  uint32_t sum = 0;
+  for (uint8_t i = 0; i < ADC_BURST_SAMPLES; i++) {
+    sum += analogRead(PIN_PRESSURE_ADC);
+  }
+  float rawAvg = static_cast<float>(sum) / ADC_BURST_SAMPLES;
+
+  if (emaAdc < 0.0f) {
+    emaAdc = rawAvg;
+  } else {
+    emaAdc = (ADC_EMA_ALPHA * rawAvg) + ((1.0f - ADC_EMA_ALPHA) * emaAdc);
+  }
+
+  if (emaAdc <= ADC_RAW_MIN) return 0.0f;
+  if (emaAdc >= ADC_RAW_MAX) return MAX_SIMULATED_PSI;
+
+  float normalized = (emaAdc - ADC_RAW_MIN) / static_cast<float>(ADC_RAW_MAX - ADC_RAW_MIN);
+  return normalized * MAX_SIMULATED_PSI;
 }
 
 const char* stateToString(SystemState s) {
@@ -42,59 +69,136 @@ const char* stateToString(SystemState s) {
   }
 }
 
-// Parse commands:
-//   "P:1,0,1,0,0,15.0" -> Activate zones 1 & 3, target 15.0 PSI
-//   "RST"              -> Open exhaust A6 until pressure <= EXHAUST_DONE_PSI
-//   "STOP"             -> Emergency stop (kills all outputs, enters FAULT)
-void handleCommand(const String& cmd) {
+void sendPacket(const String& payload) {
+  telemetrySeq++;
+  bleSendTelemetry("#" + String(telemetrySeq) + "|" + payload);
+}
+
+bool parsePresetCommand(const String& cmd, bool outZones[5], float& outPsi) {
+  if (!cmd.startsWith("P:") && !cmd.startsWith("p:")) return false;
+
+  int z[5] = {0};
+  float psi = 0.0f;
+  char extra = '\0';
+
+  int parsed = sscanf(
+    cmd.c_str() + 2,
+    "%d,%d,%d,%d,%d,%f%c",
+    &z[0], &z[1], &z[2], &z[3], &z[4], &psi, &extra
+  );
+  if (parsed != 6) return false;
+
+  bool anyZoneActive = false;
+  for (int i = 0; i < 5; i++) {
+    if (z[i] != 0 && z[i] != 1) return false;
+    outZones[i] = (z[i] == 1);
+    if (outZones[i]) anyZoneActive = true;
+  }
+
+  if (!anyZoneActive) return false;
+  if (isnan(psi) || isinf(psi) || psi <= EXHAUST_DONE_PSI || psi > MAX_SIMULATED_PSI) {
+    return false;
+  }
+
+  outPsi = psi;
+  return true;
+}
+
+ void handleCommand(const String& cmd) {
+  // 1. STOP
   if (cmd.equalsIgnoreCase("STOP")) {
-    disableAllActuators();
-    currentState = STATE_FAULT;
-    bleSendTelemetry("FAULT:EMERGENCY_STOP");
+    triggerFault("EMERGENCY_STOP");
     return;
   }
 
+  // 2. Clear fault
+  if (cmd.equalsIgnoreCase("CLEAR")) {
+    if (currentState != STATE_FAULT) {
+      sendPacket("ACK:CLEAR|NO_ACTIVE_FAULT");
+      return;
+    }
+
+    disableAllActuators();
+    digitalWrite(PIN_FAULT_LED, LOW);
+    activeFaultReason = "NONE";
+    currentState = STATE_IDLE;
+    sendPacket("ACK:CLEAR|LOCKOUT:RELEASED|STATE:IDLE");
+    return;
+  }
+
+  // 3. Status query
+  if (cmd.equalsIgnoreCase("STAT")) {
+    float psi = readFilteredPsi();
+
+    sendPacket("ACK:STAT|STATE:" +
+               String(stateToString(currentState)) +
+               "|PSI:" + String(psi, 1) +
+               "|FAULT:" + activeFaultReason);
+    return;
+  }
+
+  // 4. Reject actuator commands during a fault
+  if (currentState == STATE_FAULT) {
+    sendPacket("NACK:LOCKED_OUT|REASON:" +
+               activeFaultReason + "|SEND_CLEAR");
+    return;
+  }
+
+  // 5. Reset / deflate
   if (cmd.equalsIgnoreCase("RST")) {
+    // Repeated RST must not restart the timer
+    if (currentState == STATE_DEFLATING) {
+      sendPacket("ACK:RST|ALREADY_DEFLATING");
+      return;
+    }
+
     disableAllActuators();
     digitalWrite(PIN_EXHAUST_A6, HIGH);
     currentState = STATE_DEFLATING;
     stateStartTime = millis();
-    bleSendTelemetry("STATE:DEFLATING");
+
+    sendPacket("ACK:RST|STATE:DEFLATING");
     return;
   }
 
+  // 6. Preset inflation
   if (cmd.startsWith("P:") || cmd.startsWith("p:")) {
-    // Expected format: P:z1,z2,z3,z4,z5,psi (minimum 13 chars)
-    if (cmd.length() < 13) {
-      bleSendTelemetry("ERR:BAD_FORMAT");
+    // New presets must not restart an active timer
+    if (currentState == STATE_INFLATING ||
+        currentState == STATE_DEFLATING) {
+      sendPacket("NACK:BUSY");
+      return;
+    }
+
+    bool parsedZones[5];
+    float parsedPsi = 0.0f;
+
+    if (!parsePresetCommand(cmd, parsedZones, parsedPsi)) {
+      sendPacket("NACK:INVALID_PRESET_SYNTAX");
       return;
     }
 
     for (uint8_t i = 0; i < 5; i++) {
-      char val = cmd.charAt(2 + (i * 2));
-      targetZones[i] = (val == '1');
+      targetZones[i] = parsedZones[i];
     }
-    targetPsi = cmd.substring(12).toFloat();
+    targetPsi = parsedPsi;
 
-    if (targetPsi <= 0.0f || targetPsi > MAX_SIMULATED_PSI) {
-      bleSendTelemetry("ERR:INVALID_PSI");
-      return;
-    }
-
-    // Engage compressor A0 and selected zone valves A1-A5; ensure exhaust A6 is closed
     disableAllActuators();
-    digitalWrite(PIN_COMPRESSOR_A0, HIGH);
+
     for (uint8_t i = 0; i < 5; i++) {
       digitalWrite(ZONE_PINS[i], targetZones[i] ? HIGH : LOW);
     }
 
-    currentState = STATE_INFLATING;
     stateStartTime = millis();
-    bleSendTelemetry("STATE:INFLATING|TARGET:" + String(targetPsi, 1));
+    digitalWrite(PIN_COMPRESSOR_A0, HIGH);
+    currentState = STATE_INFLATING;
+
+    sendPacket("ACK:PRESET|STATE:INFLATING|TARGET:" +
+               String(targetPsi, 1));
     return;
   }
 
-  bleSendTelemetry("ERR:UNKNOWN_CMD");
+  sendPacket("NACK:UNKNOWN_CMD");
 }
 
 void setup() {
@@ -105,67 +209,82 @@ void setup() {
     pinMode(ZONE_PINS[i], OUTPUT);
   }
   pinMode(PIN_EXHAUST_A6, OUTPUT);
-  disableAllActuators();
+  pinMode(PIN_FAULT_LED, OUTPUT);
 
+  disableAllActuators();
+  digitalWrite(PIN_FAULT_LED, LOW);
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(PIN_PRESSURE_ADC, ADC_11db);
   pinMode(PIN_PRESSURE_ADC, INPUT);
 
   bleInit("PuttingGreen_Ctrl");
 }
 
 void loop() {
-  // 1. Check for incoming BLE commands
-  if (bleHasCommand()) {
-    String cmd = bleReadCommand();
-    Serial.println("[RX] " + cmd);
-    handleCommand(cmd);
+  bool connected = bleIsConnected();
+
+  if (wasConnected && !connected && currentState == STATE_INFLATING) {
+    triggerFault("BLE_LINK_LOST");
   }
+  wasConnected = connected;
 
-  float currentPsi = readSimulatedPsi();
-  unsigned long now = millis();
+// Check timeout before processing an ordinary command
+unsigned long now = millis();
 
-  // 2. Run state machine transitions
+bool timedState =
+  currentState == STATE_INFLATING ||
+  currentState == STATE_DEFLATING;
+
+if (timedState && now - stateStartTime >= SAFETY_TIMEOUT_MS) {
+  triggerFault(
+    currentState == STATE_INFLATING
+      ? "TIMEOUT_TBR01"
+      : "DEFLATE_TIMEOUT"
+  );
+}
+
+// Process at most one ordinary command per loop
+String cmd;
+if (bleReceiveCommand(cmd)) {
+  Serial.println("[RX] " + cmd);
+  handleCommand(cmd);
+}
+
+float currentPsi = readFilteredPsi();
+now = millis();
+
   switch (currentState) {
     case STATE_INFLATING:
-      // Check TBR01 90-second safety timeout first
       if (now - stateStartTime >= SAFETY_TIMEOUT_MS) {
-        disableAllActuators();
-        currentState = STATE_FAULT;
-        bleSendTelemetry("FAULT:TIMEOUT_TBR01");
-      }
-      // Check closed-loop pressure target reached
-      else if (currentPsi >= targetPsi) {
+        triggerFault("TIMEOUT_TBR01");
+      } else if (currentPsi >= targetPsi) {
         disableAllActuators();
         currentState = STATE_LOCKED;
-        bleSendTelemetry("preset-complete|PSI:" + String(currentPsi, 1));
+        sendPacket("EVENT:preset-complete|PSI:" + String(currentPsi, 1));
       }
       break;
 
     case STATE_DEFLATING:
-      // Vent until line pressure returns to baseline (or timeout failsafe)
       if (currentPsi <= EXHAUST_DONE_PSI) {
         disableAllActuators();
         currentState = STATE_IDLE;
-        bleSendTelemetry("reset-complete|PSI:" + String(currentPsi, 1));
+        sendPacket("EVENT:reset-complete|PSI:" + String(currentPsi, 1));
       } else if (now - stateStartTime >= SAFETY_TIMEOUT_MS) {
-        disableAllActuators();
-        currentState = STATE_FAULT;
-        bleSendTelemetry("FAULT:DEFLATE_TIMEOUT");
+        triggerFault("DEFLATE_TIMEOUT");
       }
       break;
 
     case STATE_IDLE:
     case STATE_LOCKED:
     case STATE_FAULT:
-      // Outputs remain held/off until next command
       break;
   }
 
-  // 3. Stream periodic telemetry every 1 second while connected
-  if (bleIsConnected() && (now - lastTelemetryTime >= 1000)) {
+  if (connected && (now - lastTelemetryTime >= 1000)) {
     lastTelemetryTime = now;
-    String status = String(stateToString(currentState)) + "|PSI:" + String(currentPsi, 1);
-    bleSendTelemetry(status);
+    sendPacket("HB|STATE:" + String(stateToString(currentState)) + "|PSI:" + String(currentPsi, 1));
   }
 
-  delay(20);
+  delay(10);
 }
