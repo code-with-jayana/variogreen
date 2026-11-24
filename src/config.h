@@ -2,13 +2,13 @@
 #include <Arduino.h>
 
 // Actuator Output Channels (Safe non-strapping GPIOs)
-constexpr uint8_t PIN_COMPRESSOR_A0 = 25; // Yellow LED: Compressor Relay
-constexpr uint8_t PIN_ZONE_A1       = 26; // Green LED 1: Wedge Zone 1
-constexpr uint8_t PIN_ZONE_A2       = 27; // Green LED 2: Wedge Zone 2
-constexpr uint8_t PIN_ZONE_A3       = 14; // Green LED 3: Wedge Zone 3
-constexpr uint8_t PIN_ZONE_A4       = 13; // Green LED 4: Wedge Zone 4
-constexpr uint8_t PIN_ZONE_A5       = 33; // Green LED 5: Wedge Zone 5
-constexpr uint8_t PIN_EXHAUST_A6    = 32; // Red LED: Common Exhaust Vent
+constexpr uint8_t PIN_COMPRESSOR_A0 = 25; // Compressor Relay
+constexpr uint8_t PIN_ZONE_A1       = 26; // Wedge Zone 1
+constexpr uint8_t PIN_ZONE_A2       = 27; // Wedge Zone 2
+constexpr uint8_t PIN_ZONE_A3       = 14; // Wedge Zone 3
+constexpr uint8_t PIN_ZONE_A4       = 13; // Wedge Zone 4
+constexpr uint8_t PIN_ZONE_A5       = 33; // Wedge Zone 5
+constexpr uint8_t PIN_EXHAUST_A6    = 32; // Common Exhaust Vent
 constexpr uint8_t PIN_FAULT_LED     = 23; // Fault Indicator LED
 
 const uint8_t ZONE_PINS[5] = {
